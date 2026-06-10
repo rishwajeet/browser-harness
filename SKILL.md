@@ -25,7 +25,7 @@ PY
 The code is the doc.
 
 Available interaction skills:
-- `interaction-skills/connection.md` — startup sequence, tab visibility, omnibox popup fix
+- `interaction-skills/connection.md` — startup sequence, tab visibility, omnibox popup fix, and the "DevTools is not live yet" fix (stale DevToolsActivePort → quit+relaunch Chrome yourself, no user clicking needed)
 
 Available domain skills:
 - `tiktok/upload.md`
