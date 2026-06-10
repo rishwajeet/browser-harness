@@ -29,6 +29,7 @@ Available interaction skills:
 
 Available domain skills:
 - `tiktok/upload.md`
+- `linkedin/editing-profile-and-posts.md` — contenteditable surgical-replace pattern, the feed/update spinner trap (use Page.reload, or click through the UI), stable selectors
 
 ## Tool call shape
 
