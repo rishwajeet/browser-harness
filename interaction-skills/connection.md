@@ -45,3 +45,22 @@ Prefer navigating an existing tab over `new_tab()`. Tabs created via CDP's `Targ
 tab = ensure_real_tab()
 goto("https://example.com")
 ```
+
+## "DevTools is not live yet" — the restart fix (field-tested Jun 2026)
+
+If `ensure_daemon()` fails with **"Chrome's remote-debugging page is open, but DevTools is not live yet on 127.0.0.1:9222"** AND `~/Library/Application Support/Google/Chrome/DevToolsActivePort` exists with the right port but `lsof -nP -iTCP:9222 -sTCP:LISTEN` shows nothing — the port file is **stale from a previous run**. The remote-debugging checkbox is sticky per profile but only takes effect on a fresh Chrome launch. The currently running Chrome was started before the setting (or before a sticky state could apply).
+
+**Fix — no user interaction needed, do it yourself:**
+
+```bash
+osascript -e 'tell application "Google Chrome" to quit'   # graceful: session restores tabs
+# wait for process to actually exit (up to ~8s)
+while pgrep -x "Google Chrome" >/dev/null; do sleep 1; done
+open -a "Google Chrome"
+sleep 6
+lsof -nP -iTCP:9222 -sTCP:LISTEN   # should now show Chrome LISTENing
+```
+
+Then the FIRST harness connect after restart may fail once with **"CDP WS handshake failed: timed out during opening handshake"** — that's Chrome's Allow dialog (or just slow startup). Retry every ~5s for up to 30s; it connects. Only if 9222 is still dead after a clean relaunch does the user actually need to tick the checkbox at `chrome://inspect/#remote-debugging` (then restart Chrome again).
+
+Don't ask the user to click anything until you've tried the restart — the checkbox being sticky means most "not live" states are fixed by relaunch alone.
