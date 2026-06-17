@@ -30,6 +30,8 @@ Available interaction skills:
 Available domain skills:
 - `tiktok/upload.md`
 - `linkedin/editing-profile-and-posts.md` — contenteditable surgical-replace pattern, the feed/update spinner trap (use Page.reload, or click through the UI), stable selectors
+- `linkedin/job-posting.md` — post-a-job flow map, draft carry-over trap (wrong company!), 1-free-job limit, external-apply setup, the preload-iframe rerender trap
+- `script/apps-script-editor.md` — run Apps Script in the user's account (bulk Google Forms/Docs/Sheets creation), Monaco insertText, first-run OAuth popup flow
 
 ## Tool call shape
 
@@ -75,6 +77,7 @@ Only if you start struggling with a specific mechanic while navigating, look in 
 - `downloads.md`
 - `drag-and-drop.md`
 - `dropdowns.md`
+- `headless-driven-capture.md` — when the user's Chrome CDP is wedged, or you need clean screenshot FILES: drive a fresh headless Chrome via `BU_CDP_WS` + raw `Page.captureScreenshot`. Capture pitfalls (clipping, fixed-nav, dev badge, animation hacks).
 - `iframes.md`
 - `network-requests.md`
 - `print-as-pdf.md`
