@@ -48,8 +48,57 @@ def daemon_alive(name=None):
         return False
 
 
-def ensure_daemon(wait=60.0, name=None, env=None):
-    """Idempotent. `env` is merged into the child process env."""
+def _wedge_signature(msg):
+    """True when a daemon-startup failure means the user's normal Chrome is
+    unreachable for CDP — the un-clickable 'Allow remote debugging?' modal
+    (Chrome 136+) or a stale/missing DevToolsActivePort. These are exactly the
+    cases automation_session.sh's dedicated profile fixes."""
+    if not msg:
+        return False
+    s = msg.lower()
+    return any(
+        k in s
+        for k in (
+            "devtools is not live",
+            "devtoolsactiveport not found",
+            "remote-debugging",
+            "handshake",            # "opening handshake" / "CDP WS handshake failed"
+            "no close frame",
+            "server rejected",      # stale ws path → HTTP 404 on connect
+            "http 404",
+            "click allow",          # daemon's own "click Allow in Chrome" hint
+        )
+    )
+
+
+def _automation_fallback():
+    """Boot the dedicated, dialog-free automation-profile Chrome and return its
+    BU_CDP_WS endpoint (or None). This is the autonomous form of the manual
+    `eval "$(automation_session.sh)"` step — wired into ensure_daemon so a wedged
+    default profile self-heals without anyone remembering the magic eval."""
+    import subprocess
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "automation_session.sh")
+    if not os.path.exists(script):
+        return None
+    try:
+        r = subprocess.run(["bash", script], capture_output=True, text=True, timeout=240)
+    except Exception:
+        return None
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("export BU_CDP_WS="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def ensure_daemon(wait=60.0, name=None, env=None, _self_heal=True):
+    """Idempotent. `env` is merged into the child process env.
+
+    If the daemon can't come up because the user's normal Chrome is wedged
+    (un-clickable consent modal / stale DevToolsActivePort) and no BU_CDP_WS is
+    already in play, automatically boot the dedicated automation profile and
+    retry once — so callers never need the manual automation_session.sh eval."""
     if daemon_alive(name):
         return
     import subprocess
@@ -71,6 +120,14 @@ def ensure_daemon(wait=60.0, name=None, env=None):
             break
         time.sleep(0.2)
     msg = _log_tail(name)
+    if _self_heal and not e.get("BU_CDP_WS") and _has_local_gui() and _wedge_signature(msg):
+        ws = _automation_fallback()
+        if ws:
+            os.environ["BU_CDP_WS"] = ws
+            restart_daemon(name)  # clear any half-started daemon + stale socket/pid
+            return ensure_daemon(
+                wait=wait, name=name, env={**(env or {}), "BU_CDP_WS": ws}, _self_heal=False
+            )
     raise RuntimeError(msg or f"daemon {name or NAME} didn't come up -- check /tmp/bu-{name or NAME}.log")
 
 

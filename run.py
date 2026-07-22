@@ -37,7 +37,12 @@ def main():
             "  PY"
         )
     ensure_daemon()
-    exec(sys.stdin.read())
+    # Use a single dict as both globals and locals so module-level assignments in the
+    # user's block are visible inside functions they define. Without this, exec treats
+    # top-level names as locals of main(), and nested functions' __globals__ can't see
+    # them — a surprising pitfall when users define helpers like `studio_url()`.
+    ns = dict(globals())
+    exec(sys.stdin.read(), ns)
 
 
 if __name__ == "__main__":

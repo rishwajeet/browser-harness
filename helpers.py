@@ -130,6 +130,11 @@ def switch_tab(target_id):
     cdp("Target.activateTarget", targetId=target_id)
     sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
     _send({"meta": "set_session", "session_id": sid})
+    # Enable event domains on the new session so console_messages() / network_requests() see activity.
+    # The daemon only enables these on the first attached session; new tabs need it too.
+    for d in ("Page", "DOM", "Runtime", "Network"):
+        try: cdp(f"{d}.enable")
+        except Exception: pass
     _mark_tab()
     return sid
 
@@ -214,3 +219,293 @@ def http_get(url, headers=None, timeout=20.0):
         data = r.read()
         if r.headers.get("Content-Encoding") == "gzip": data = gzip.decompress(data)
         return data.decode()
+
+
+# --- window / viewport ---
+def resize_window(width, height):
+    """Resize the actual browser window (CSS px). Persists across tabs on the same window."""
+    w = cdp("Browser.getWindowForTarget")
+    cdp("Browser.setWindowBounds", windowId=w["windowId"], bounds={"width": int(width), "height": int(height)})
+
+
+# --- events (console + network) ---
+# The daemon buffers all CDP events (max 500) and drain_events() clears the buffer.
+# These helpers drain once and filter, so calling console_messages() + network_requests()
+# in the same browser-harness invocation both see the same batch. Within the same Python
+# process (same `browser-harness <<PY` block), subsequent calls only see NEW events.
+
+_events_cache: list = []
+
+def _refresh_events():
+    _events_cache.extend(drain_events())
+    return _events_cache
+
+def console_messages(pattern=None, level=None, clear=False):
+    """Console output captured since daemon started / last clear.
+
+    pattern: regex filtered against the stringified message
+    level: one of 'log','info','warn','error','debug' (the CDP 'type' field)
+    clear: drop cached events after returning (fresh slate for next call)
+    """
+    import re
+    _refresh_events()
+    out = []
+    for e in _events_cache:
+        if e.get("method") != "Runtime.consoleAPICalled": continue
+        p = e.get("params", {})
+        if level and p.get("type") != level: continue
+        args = p.get("args", [])
+        text = " ".join(str(a.get("value", a.get("description", ""))) for a in args)
+        if pattern and not re.search(pattern, text): continue
+        out.append({"level": p.get("type"), "text": text, "timestamp": p.get("timestamp"),
+                    "stack": p.get("stackTrace")})
+    if clear: _events_cache.clear()
+    return out
+
+def network_requests(pattern=None, types=None, status=None, clear=False):
+    """Network requests since daemon started. Pairs requestWillBeSent + responseReceived.
+
+    pattern: regex filtered against URL
+    types: iterable of resource types ('Document','Fetch','XHR','Image','Script',...)
+    status: int or iterable of HTTP status codes
+    clear: drop cached events after returning
+    """
+    import re
+    _refresh_events()
+    reqs: dict = {}
+    for e in _events_cache:
+        m = e.get("method", "")
+        p = e.get("params", {})
+        if m == "Network.requestWillBeSent":
+            reqs[p["requestId"]] = {
+                "url": p["request"]["url"],
+                "method": p["request"]["method"],
+                "type": p.get("type", "Other"),
+                "initiator": p.get("initiator", {}).get("type"),
+            }
+        elif m == "Network.responseReceived" and p["requestId"] in reqs:
+            resp = p["response"]
+            reqs[p["requestId"]].update({"status": resp["status"], "mimeType": resp["mimeType"]})
+        elif m == "Network.loadingFailed" and p["requestId"] in reqs:
+            reqs[p["requestId"]]["failed"] = p.get("errorText")
+    out = list(reqs.values())
+    if pattern: out = [r for r in out if re.search(pattern, r["url"])]
+    if types: out = [r for r in out if r.get("type") in set(types)]
+    if status is not None:
+        wanted = {status} if isinstance(status, int) else set(status)
+        out = [r for r in out if r.get("status") in wanted]
+    if clear: _events_cache.clear()
+    return out
+
+
+# --- SPA-safe waits ---
+def wait_for_xhr(url_pattern, timeout=15.0, status=None, poll=0.2):
+    """Wait until a network response whose URL matches url_pattern (regex) arrives.
+
+    Returns the request record (dict with url/status/method/type/...) or None on timeout.
+    Use before querying the DOM on SPA pages — readyState='complete' only covers the
+    outer shell, the data XHR comes later. Enables Network domain on the current
+    session if not already (daemon enables it on initial attach + switch_tab).
+    """
+    import re
+    try: cdp("Network.enable")
+    except Exception: pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for r in network_requests(pattern=url_pattern):
+            if r.get("status") is None: continue
+            if status is not None and r["status"] != status: continue
+            return r
+        time.sleep(poll)
+    return None
+
+def wait_for_network_idle(timeout=10.0, idle_ms=500, poll=0.15):
+    """Wait until no new `Network.requestWillBeSent` fires for idle_ms, or timeout.
+
+    Good for 'wait for the SPA to finish its burst of fetches'. Returns True on idle,
+    False on timeout.
+    """
+    try: cdp("Network.enable")
+    except Exception: pass
+    deadline = time.time() + timeout
+    last_activity = time.time()
+    while time.time() < deadline:
+        fresh = drain_events()
+        _events_cache.extend(fresh)
+        if any(e.get("method") == "Network.requestWillBeSent" for e in fresh):
+            last_activity = time.time()
+        if (time.time() - last_activity) * 1000 >= idle_ms:
+            return True
+        time.sleep(poll)
+    return False
+
+
+# --- shadow-DOM-piercing selectors ---
+# document.querySelector stops at shadow-root boundaries. Many modern apps (YT Studio,
+# Gmail, any Polymer/LitElement app) bury their interactive elements inside nested
+# shadow roots. These helpers traverse through them.
+
+_DEEP_QUERY_JS = r"""
+(selector) => {
+  function walk(root) {
+    if (!root) return null;
+    try {
+      const hit = root.querySelector ? root.querySelector(selector) : null;
+      if (hit) return hit;
+    } catch (e) {}
+    const all = (root.querySelectorAll ? root.querySelectorAll('*') : []);
+    for (const el of all) {
+      if (el.shadowRoot) {
+        const f = walk(el.shadowRoot);
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+  const el = walk(document);
+  if (!el) return null;
+  el.scrollIntoView({block: 'center', inline: 'center'});
+  const r = el.getBoundingClientRect();
+  const cs = getComputedStyle(el);
+  return JSON.stringify({
+    x: r.x + r.width/2, y: r.y + r.height/2,
+    w: r.width, h: r.height,
+    text: (el.innerText || el.textContent || '').trim().slice(0, 200),
+    tag: el.tagName.toLowerCase(),
+    visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none'
+  });
+}
+"""
+
+def query_deep(selector):
+    """document.querySelector that pierces shadow DOM. Returns {x,y,w,h,text,tag,visible} or None."""
+    r = js(f"({_DEEP_QUERY_JS})({json.dumps(selector)})")
+    if not r: return None
+    return json.loads(r) if isinstance(r, str) else r
+
+def wait_for_element(selector, timeout=15.0, visible=True, poll=0.25):
+    """Poll query_deep() until an element is found (and visible if visible=True) or timeout. Returns the hit or None."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hit = query_deep(selector)
+        if hit and (not visible or hit.get("visible")):
+            return hit
+        time.sleep(poll)
+    return None
+
+def click_deep(selector, timeout=10.0):
+    """Wait for an element (shadow-DOM-piercing), scroll it into view, and click its center.
+
+    Raises RuntimeError if not found within timeout.
+    """
+    hit = wait_for_element(selector, timeout=timeout, visible=True)
+    if not hit:
+        raise RuntimeError(f"click_deep: {selector!r} not found or not visible within {timeout}s")
+    click(hit["x"], hit["y"])
+    return hit
+
+
+# --- multi-window tab handling ---
+def find_tab(url_substr=None, title_substr=None):
+    """Find a tab (across all Chrome windows) by URL or title substring. Returns first match or None."""
+    for t in list_tabs(include_chrome=False):
+        if url_substr and url_substr in t.get("url", ""): return t
+        if title_substr and title_substr in t.get("title", ""): return t
+    return None
+
+def focus_browser():
+    """Bring the Chrome application to the macOS foreground. No-op on other OSes.
+
+    Target.activateTarget activates a tab within its window, but on macOS that doesn't
+    raise Chrome above other apps. Many sites throttle rendering when Chrome isn't the
+    frontmost app (IntersectionObserver stalls, requestAnimationFrame slows). Call this
+    before running a flow on a virtualized/lazy-rendered page.
+    """
+    import subprocess
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Google Chrome" to activate'],
+            timeout=2, check=False, capture_output=True,
+        )
+    except Exception: pass
+
+def switch_to(url_substr=None, title_substr=None):
+    """find_tab + switch_tab + focus_browser, in one call. Returns the tab dict or None."""
+    t = find_tab(url_substr=url_substr, title_substr=title_substr)
+    if not t: return None
+    switch_tab(t["targetId"])
+    focus_browser()
+    return t
+
+
+# --- downloads ---
+def wait_for_download(before_files=None, dir=None, timeout=60.0, poll=0.5, stable_seconds=1.0):
+    """Wait for a new file to appear in `dir` (default ~/Downloads) and finish writing.
+
+    `before_files` is an optional snapshot of the directory taken *before* the click
+    that triggers the download — prevents matching an older file. If omitted, this
+    function snapshots now (only works if the download truly starts after this call).
+
+    Waits for any *.crdownload partial to finalize, plus stable_seconds of no size change
+    for safety. Returns the absolute path of the new file, or None on timeout.
+    """
+    import os
+    dir = os.path.expanduser(dir or "~/Downloads")
+    if before_files is None:
+        before_files = set(os.listdir(dir))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        current = set(os.listdir(dir))
+        new = [f for f in (current - before_files) if not f.endswith(".crdownload") and not f.startswith(".")]
+        if new:
+            path = os.path.join(dir, max(new, key=lambda f: os.path.getmtime(os.path.join(dir, f))))
+            # Wait for size to stabilize
+            last_size = -1
+            stable_start = time.time()
+            while time.time() - stable_start < stable_seconds:
+                s = os.path.getsize(path)
+                if s != last_size:
+                    last_size = s
+                    stable_start = time.time()
+                time.sleep(0.1)
+            return path
+        time.sleep(poll)
+    return None
+
+def snapshot_downloads(dir=None):
+    """Snapshot the Downloads dir — pass result as `before_files` to wait_for_download."""
+    import os
+    return set(os.listdir(os.path.expanduser(dir or "~/Downloads")))
+
+
+# --- recording ---
+def record_gif(duration=5.0, fps=4, out="/tmp/recording.gif"):
+    """Capture screenshots at fps for duration seconds, encode GIF via ffmpeg.
+
+    Blocks for `duration`. Runs synchronously — no concurrent actions. Requires ffmpeg.
+    For recording a specific interaction, kick this off in a thread:
+        from threading import Thread
+        t = Thread(target=record_gif, kwargs={"duration": 8, "out": "/tmp/flow.gif"})
+        t.start(); click(...); type_text(...); t.join()
+    """
+    import subprocess, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        n = int(duration * fps)
+        interval = 1.0 / fps
+        for i in range(n):
+            t0 = time.time()
+            screenshot(f"{tmp}/{i:04d}.png")
+            elapsed = time.time() - t0
+            if elapsed < interval: time.sleep(interval - elapsed)
+        palette = f"{tmp}/palette.png"
+        subprocess.run(
+            ["ffmpeg", "-y", "-framerate", str(fps), "-i", f"{tmp}/%04d.png",
+             "-vf", "palettegen=reserve_transparent=0", palette],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-framerate", str(fps), "-i", f"{tmp}/%04d.png",
+             "-i", palette, "-lavfi", f"fps={fps}[x];[x][1:v]paletteuse", out],
+            check=True, capture_output=True,
+        )
+    return out
