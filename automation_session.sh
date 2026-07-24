@@ -119,9 +119,14 @@ launch() {
   local port="$1"
   rm -f "$DST/SingletonLock" "$DST/SingletonCookie" "$DST/SingletonSocket"
   log "launching automation Chrome (profile: $(basename "$DST"), port $port)…"
-  "$CHROME" --user-data-dir="$DST" --remote-debugging-port="$port" \
+  # LaunchServices owns the new app instance after this short-lived shell exits.
+  # Starting the Mach-O directly (even under nohup) can leave it tied to the
+  # bootstrap process: the first harness call works, then Chrome and its CDP
+  # websocket disappear as soon as automation_session.sh returns.
+  open -na "Google Chrome" --args \
+    --user-data-dir="$DST" --remote-debugging-port="$port" \
     --remote-allow-origins='*' --no-first-run --no-default-browser-check \
-    >/dev/null 2>&1 &
+    >/dev/null 2>&1
   for _ in $(seq 1 30); do port_listening "$port" && break; sleep 1; done
   port_listening "$port" || { log "FATAL: port $port did not come up"; exit 1; }
 }
