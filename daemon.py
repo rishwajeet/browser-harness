@@ -154,6 +154,18 @@ class Daemon:
 
     async def handle(self, req):
         meta = req.get("meta")
+        if meta == "health":
+            try:
+                result = await asyncio.wait_for(
+                    self.cdp.send_raw("Target.getTargets"), timeout=3
+                )
+                return {
+                    "ok": True,
+                    "targets": len(result.get("targetInfos", [])),
+                    "session_id": self.session,
+                }
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
         if meta == "drain_events":
             out = list(self.events); self.events.clear()
             return {"events": out}

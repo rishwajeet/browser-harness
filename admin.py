@@ -48,6 +48,38 @@ def daemon_alive(name=None):
         return False
 
 
+def daemon_healthy(name=None, timeout=3.0):
+    """True only when the daemon socket and its backing CDP connection work.
+
+    A Unix socket can outlive Chrome's websocket. Treating that stale socket as
+    healthy was the reason unattended callers kept reusing a dead daemon until
+    somebody manually restarted it.
+    """
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(_paths(name)[0])
+        s.sendall(b'{"meta":"health"}\n')
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(1 << 20)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        response = json.loads(data)
+        return response.get("ok") is True
+    except (
+        FileNotFoundError,
+        ConnectionRefusedError,
+        socket.timeout,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+
 def _wedge_signature(msg):
     """True when a daemon-startup failure means the user's normal Chrome is
     unreachable for CDP — the un-clickable 'Allow remote debugging?' modal
@@ -100,7 +132,21 @@ def ensure_daemon(wait=60.0, name=None, env=None, _self_heal=True):
     already in play, automatically boot the dedicated automation profile and
     retry once — so callers never need the manual automation_session.sh eval."""
     if daemon_alive(name):
-        return
+        if daemon_healthy(name):
+            return
+        # The relay exists but Chrome/CDP is gone. Clear it before startup so
+        # the normal self-heal path can boot the dedicated automation profile.
+        restart_daemon(name)
+        if _self_heal and not (env or {}).get("BU_CDP_WS") and _has_local_gui():
+            ws = _automation_fallback()
+            if ws:
+                os.environ["BU_CDP_WS"] = ws
+                return ensure_daemon(
+                    wait=wait,
+                    name=name,
+                    env={**(env or {}), "BU_CDP_WS": ws},
+                    _self_heal=False,
+                )
     import subprocess
 
     e = {**os.environ, **({"BU_NAME": name} if name else {}), **(env or {})}

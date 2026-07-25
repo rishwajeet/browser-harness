@@ -8,7 +8,8 @@ The daemon's `attach_first_page()` handles this by creating an `about:blank` tab
 
 ## Startup sequence
 
-1. Check if a daemon is already running with `daemon_alive()`
+1. Check if a daemon is already running with `daemon_alive()` and backed by a
+   responsive Chrome websocket with `daemon_healthy()`
 2. If stale sockets exist but daemon is dead, clean them up
 3. List open tabs with `list_tabs()` to see what's available
 4. `ensure_real_tab()` attaches to a real page
@@ -49,7 +50,8 @@ goto("https://example.com")
 ## ✅ Auto self-heal (hardened 2026-06-28) — usually you do NOTHING
 
 `ensure_daemon()` now self-heals the wedged-default-Chrome cases automatically. If the
-daemon can't come up because the user's normal Chrome is unreachable for CDP — the
+daemon can't come up, or its Unix socket is still alive after Chrome's websocket
+has died, because the user's normal Chrome is unreachable for CDP — the
 un-clickable "Allow remote debugging?" modal, a stale/missing `DevToolsActivePort`, or a
 stale ws path (HTTP 404 on connect) — and no `BU_CDP_WS` is already set, it runs
 `automation_session.sh` itself, points the daemon at the dedicated profile via `BU_CDP_WS`,
